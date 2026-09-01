@@ -174,47 +174,135 @@ It works — the callback fires and returns OK:
 **It was not the blocker.** Still 2 draws. A real gap in the shared runtime,
 closed for every title that calls it, but not this hang.
 
+### A wrong turn, corrected
+
+The first read of the stall was that the front-end was stuck in an **audio drain
+loop**: 2 draws, 2 clears, then 59 iterations of `timer_usleep(2500 us)` from one
+fixed site (`lr=0x000E4518`), inside a function whose only exit calls
+`cellAudioPortStop`.
+
+That was wrong, and the log said so:
+
+```
+sys_ppu_thread_create tid=2 name="pcm" entry=0x00157B10
+```
+
+The `usleep` lines carry `cia=0x00157B10` - the same address. That loop is the
+**"pcm" audio thread ticking normally at 400 Hz**, which is what a PCM thread is
+supposed to do. It was never the hang; it was just the loudest thing in the log.
+
+Two lessons worth keeping. First, "the most frequent line in the log" is not the
+same as "the blocked thread" - a healthy 400 Hz worker will always out-shout a
+thread that is silently asleep. Second, the watchdog's own label was actively
+misleading: it prints
+
+```
+last HLE call = 0x1BC200F4 (cellSysutilGetSystemParamInt)
+```
+
+but NID `0x1BC200F4` is **`sys_lwmutex_unlock`** in `sysPrxForUser`. The name
+table is wrong, and following the printed name leads into `cellSysutil` and away
+from everything that mattered. Trust the NID, not the label.
+
 ### The actual blocker
 
-Counting what repeats gave the shape: **2 `DRAW_ARRAYS`, 2 `CLEAR_SURFACE`, then
-59 iterations of `timer_usleep(2500 us)` from one fixed call site**,
-`lr=0x000E4518`. Disassembling the containing function (`0x000E4240`) made it
-plain:
+Finding the *blocked* thread rather than the *busy* one settled it. The main
+guest thread (tid 1) sits here:
 
 ```
-000E4510  lwz  r3, -0x49E8(r2)
-000E4514  bl   0x14BD4C          ; sys_lwmutex_unlock
-000E4520  li   r3, 2500
-000E4524  li   r11, 141          ; sys_timer_usleep
-000E4528  sc
-000E452C  lwz  r29, -0x49B8(r2)
-000E4530  lwz  r0, 0(r29)        ; reload counter
-000E4538  cmpwi cr7, r0, 0
-000E453C  bgt  cr7, 0xE42D8      ; > 0 -> re-lock, go round again
-000E4540  ...                    ; else: cellAudioPortStop, store -1, return
+[ppu] lv2_syscall 190 (stub)
+[WAIT] event_queue_receive(q=2 timeout=0) tid=1 cia=0x00000000 lr=0x000BC740
 ```
 
-Take a lightweight mutex, work, release, sleep 2.5 ms, repeat while a counter
-stays above zero — and the only exit calls **`cellAudioPortStop`**. This is an
-audio drain/wait. The front-end is waiting for sound work to complete before
-advancing past the logo sequence, and the counter never reaches zero.
+lv2 syscall **190 is `sys_spu_thread_write_spu_mb`** - the PPU-to-SPU inbound
+mailbox write. Main hands work to the MultiStream mixer through that mailbox and
+then waits on event queue 2 for the SPU to report back; the SPU's outbound events
+are bound to exactly that queue (`thread_connect_event tid=0x2000 queue=0x2`).
 
-That makes `cellAudioSetPortLevel` (unimplemented, silently returning a fake
-`CELL_OK`) the prime suspect.
+190 is the **only** SPU-thread syscall missing from an otherwise complete
+registration table in `lv2_register.c`, and the outbound (SPU to PPU) direction
+is fully implemented. So the message is dropped, the mixer is never told to do
+anything, no completion event is posted, and main waits for a wake that cannot
+come.
 
-> **A diagnostic trap worth recording.** The watchdog prints
-> `last HLE call = 0x1BC200F4 (cellSysutilGetSystemParamInt)`. NID `0x1BC200F4`
-> is actually **`sys_lwmutex_unlock`** in `sysPrxForUser` — the runtime's
-> watchdog name table mislabels it, and following the printed name leads into
-> `cellSysutil` and away from the audio loop entirely. Trust the NID, not the
-> label. Worth fixing upstream so the next port does not lose the same time.
+### Two fixes that had to land first
+
+**The SPU was never running at all.** Before any of the above could even be
+observed, the log said:
+
+```
+[SPU] thread tid=0x2000 image @0x10017B80 (54272 bytes)
+      fp=0xE82F0FE56D1B967B is NOT in the workload registry
+[SPU] group_start id=0x1000 (1 thread(s), none spawned: 0 ran synchronously, 1 had no fallback)
+```
+
+The registration used `0xF92BC94C97BE3985`, the FNV-1a-64 of the file
+`extract_spu_images.py` wrote out. The runtime fingerprints the image **as it
+sits in guest memory** - same 54,272 bytes, different content, because the
+extractor reconstructs an ELF wrapper. Registering the runtime's fingerprint made
+it spawn:
+
+```
+[SPU] group_start id=0x1000 tid=0x2000 entry=0x00000090 -> spawned host thread
+[SPU] group_start id=0x1000 (1 host threads running, 0 instant)
+```
+
+Worth remembering for every future port: when a lifted SPU image "isn't in the
+registry", the runtime prints the fingerprint it actually wants - use that one,
+not the one computed offline from the extracted file.
+
+**`sys_cond_signal_to` (lv2 syscall 110) was never registered.** It was the only
+member of the condvar family missing - create, destroy, wait, signal and
+signal_all were all there - so it fell through to the generic stub and returned
+success without waking anyone. This title uses it:
+
+```
+[SIGNAL] cond_signal_to(cond=1 target_tid=1) tid=3 lr=0x000762E0
+```
+
+A missing *wait* primitive fails loudly. A missing *wake* primitive just
+deadlocks whoever was waiting, which is far harder to spot. Implemented upstream;
+it wakes all waiters rather than the named one (the cond struct holds a bare
+condition variable with no waiter list), which can never fail to wake the
+intended thread. Marked with a `ponytail:` comment naming the upgrade path.
+
+### The HDD-game path
+
+`cellHddGameCheck` now correctly reports that the HDD game directory exists - and
+the title immediately acted on it, re-opening its resources from
+`/dev_hdd0/game/NPUB30003/USRDIR/`:
+
+```
+[fs] open FAIL '/dev_hdd0/game/NPUB30003/USRDIR/strings.tsv'
+[fs] open FAIL '/dev_hdd0/game/NPUB30003/USRDIR/uiresource.txt'
+```
+
+That is not a regression - it is the *correct* path. `CATEGORY=HG` means this
+title installs to `/dev_hdd0/game/<TITLEID>/`, and the relative-path loads seen
+earlier are only its first pass. Mirroring `USRDIR` under
+`hdd0/game/NPUB30003/` (a directory junction, no 87 MB copy) cleared every
+remaining resource failure. What is left is `cache.dat` (absent by design on a
+first run) and `main_menu_circles.texture.ps3`, which is genuinely not shipped in
+the package.
+
+### Where it stands
+
+Boots, renders, loads its entire front-end from the correct HDD path, spawns and
+runs the lifted MultiStream SPU mixer. Blocks on one missing syscall.
 
 ### Next
 
-1. Implement `cellAudioSetPortLevel`, `cellPadSetPressMode`, `cellPadSetSensorMode`
-   and `inet_addr` — all small, all genuine gaps in the shared runtime.
-2. Work out what decrements the counter at `-0x49B8(r2)` and why our `cellAudio`
-   path never drives it to zero. That is the hang.
-3. Fix the watchdog NID→name table so `0x1BC200F4` reports `sys_lwmutex_unlock`.
-4. Get `rwt.sr` opening — nothing has touched the romset container yet, so the
+1. **Implement `sys_spu_thread_write_spu_mb` (syscall 190).** This needs a
+   `tid -> spu_context*` registry: the context is a stack local inside
+   `spu_run_lifted_job_abi`, so nothing outside can reach `ctx->ch_in_mbox`
+   today. It also raises a real design question - the MultiStream mixer is a
+   *persistent worker* that blocks on `rdch SPU_RdInMbox`, while the runtime's
+   lifted-SPU model is job-shaped (enter, drain, finish). Expect to touch the
+   SPU execution model, not just add a syscall.
+2. Implement the four remaining NIDs: `cellAudioSetPortLevel` (the only one of
+   the title's 8 `cellAudio` imports not covered), `cellPadSetPressMode`,
+   `cellPadSetSensorMode`, `inet_addr`.
+3. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
+   `sys_lwmutex_unlock`. It cost real time here and will cost it again.
+4. Get `rwt.sr` opening - nothing has touched the romset container yet, so the
    arcade emulator core has not started.

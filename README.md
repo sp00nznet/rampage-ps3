@@ -29,41 +29,32 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current blocker — an audio drain loop
+### Current blocker - a dropped SPU mailbox write
 
-The title loads its entire front-end (fonts, `strings.tsv`, the Digital Eclipse /
-Midway / legal logos, and every `FE_IMAGES` + `PS3_IMAGES` texture), issues
-exactly **2 draws and 2 clears**, and then blocks forever.
-
-The loop is at guest `0x000E4240`, polling from `0x000E4518`:
+The title loads its entire front-end, issues **2 draws and 2 clears**, and then
+the main thread blocks forever. The chain is now fully traced:
 
 ```
-000E4510  lwz  r3, -0x49E8(r2)
-000E4514  bl   0x14BD4C          ; sys_lwmutex_unlock
-000E4520  li   r3, 2500
-000E4524  li   r11, 141          ; sys_timer_usleep
-000E4528  sc                     ; sleep 2.5 ms
-000E452C  lwz  r29, -0x49B8(r2)
-000E4530  lwz  r0, 0(r29)        ; reload the counter
-000E4538  cmpwi cr7, r0, 0
-000E453C  bgt  cr7, 0xE42D8      ; still > 0 -> re-lock and go round again
-          ...                    ; falls through to cellAudioPortStop
+[SPU] group_start ... tid=0x2000 -> spawned host thread   <- MultiStream mixer running
+[rwh] #1 img=1 ctx=... entry=...                          <- lifted SPU image ran
+[ppu] lv2_syscall 190 (stub)                              <- sys_spu_thread_write_spu_mb: DROPPED
+[WAIT] event_queue_receive(q=2 timeout=0) tid=1 lr=0x000BC740   <- main blocks, forever
 ```
 
-So it takes a lightweight mutex, does work, releases it, sleeps 2.5 ms, and
-repeats **while a counter stays above zero** — and the only way out calls
-`cellAudioPortStop`. That makes it an audio drain/wait: the front-end is waiting
-for sound work to finish before advancing past the logo sequence, and the
-counter never reaches zero.
+Main hands work to the MultiStream SPU by writing its inbound mailbox
+(`sys_spu_thread_write_spu_mb`, lv2 syscall **190**), then waits on event queue 2
+for the SPU to report back. The SPU's outbound events are bound to that very
+queue (`thread_connect_event tid=0x2000 queue=0x2`). Syscall 190 is the **only**
+SPU-thread syscall missing from an otherwise complete registration table, so the
+message is dropped, the mixer is never told to do anything, no completion event
+is posted, and main waits for a wake that cannot come.
 
-`cellAudioSetPortLevel` is the prime suspect: the title calls it, our runtime
-has no handler, and it silently returns a fake `CELL_OK`.
-
-> **A diagnostic trap worth recording.** The watchdog reports
-> `last HLE call = 0x1BC200F4 (cellSysutilGetSystemParamInt)`. That NID is
-> **`sys_lwmutex_unlock`** in `sysPrxForUser` — the runtime's watchdog name table
-> mislabels it. Chasing the printed name leads into `cellSysutil` and away from
-> the actual audio loop. Trust the NID, not the label.
+**Next step.** Implementing 190 needs a `tid -> spu_context*` registry: the
+context is a stack local inside `spu_run_lifted_job_abi`, so nothing outside can
+reach `ctx->ch_in_mbox` today. It also raises a real design question - the
+MultiStream mixer is a *persistent worker* that blocks on `rdch SPU_RdInMbox`,
+whereas the runtime's lifted-SPU model is job-shaped (enter, drain, finish). That
+is a change to the SPU execution model, not a one-line syscall.
 
 ### Remaining unresolved NIDs
 
@@ -74,8 +65,8 @@ has no handler, and it silently returns a fake `CELL_OK`.
 | `0x56DFE179` | `cellAudio` | `cellAudioSetPortLevel` |
 | `0xDABBC2C0` | `sys_net` | `inet_addr` |
 
-`0x9117DF20` was **`cellHddGameCheck`** and is now implemented (see below); its
-callback fires and returns OK, but it was not the blocker.
+`cellAudioSetPortLevel` is the only one of the title's 8 `cellAudio` imports not
+covered; the other seven are implemented.
 
 ---
 
@@ -198,17 +189,31 @@ cmake -S . -B build -G Ninja \
   -DCMAKE_C_COMPILER=clang-cl -DCMAKE_CXX_COMPILER=clang-cl
 cmake --build build
 
-# 5. Run. The title opens its assets with RELATIVE paths, so the VFS root must
-#    be USRDIR, not the PS3_GAME root:
+# 5. This is a CATEGORY=HG title, so it installs to /dev_hdd0/game/<TITLEID>/.
+#    Mirror USRDIR there (a junction avoids copying 87 MB):
+mkdir -p hdd0/game/NPUB30003 && cp extracted/PARAM.SFO hdd0/game/NPUB30003/
+#    Windows:  New-Item -ItemType Junction -Path hdd0/game/NPUB30003/USRDIR \
+#                        -Target vfs/PS3_GAME/USRDIR
+#    POSIX:    ln -s ../../../vfs/PS3_GAME/USRDIR hdd0/game/NPUB30003/USRDIR
+
+# 6. Run:
 PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
   ./build/rampage.exe vfs/PS3_GAME/USRDIR/EBOOT.elf
 ```
 
 ### Gotchas found the hard way
 
-- **`PS3_VFS_ROOT` must point at `USRDIR`.** The title opens `strings.tsv`,
-  `fonts/Font_M.rf`, `uiresource.txt` and every texture by relative path. With the
-  root at the default the whole front-end silently fails to load.
+- **The title loads its content twice, by two different paths.** Early boot uses
+  RELATIVE paths (`strings.tsv`, `fonts/Font_M.rf`, `uiresource.txt`), so
+  `PS3_VFS_ROOT` must point at `USRDIR`. Then, once `cellHddGameCheck` reports the
+  HDD game directory exists, it re-opens everything under
+  `/dev_hdd0/game/NPUB30003/USRDIR/` - which is the *correct* path for a
+  `CATEGORY=HG` title. Both layouts have to be present.
+- **A lifted SPU image is fingerprinted as it sits in GUEST MEMORY**, not as the
+  file `extract_spu_images.py` writes out. Same byte count here, different
+  content, so registering the file's fingerprint left the mixer silently
+  undispatched (`is NOT in the workload registry ... 1 had no fallback`). The
+  runtime prints the fingerprint it actually wants - use that one.
 - **This PKG is a *debug* (non-finalized) package** (`pkg_type=0x0000`), not a
   retail one, so it uses the SHA-1 keystream rather than AES-CTR. `pkg_extract.py`
   had that keystream wrong; fixed upstream (see below).
@@ -218,6 +223,17 @@ PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
   expected to be absent on a first run.
 
 ## 🔧 Upstream fixes made for this port
+
+- `runtime/syscalls/sys_cond.c` - **`sys_cond_signal_to` (lv2 syscall 110) was
+  never registered**, the only member of the condvar family missing, so it hit
+  the generic stub and returned success without waking anyone. A missing *wait*
+  primitive fails loudly; a missing *wake* primitive just deadlocks the waiter.
+  This title uses it (`cond_signal_to(cond=1 target_tid=1)`).
+- `libs/system/cellGame.c` - **`cellHddGameCheck` implemented.** It is async:
+  firmware runs the title's `funcStat` callback and the boot state machine waits
+  on it, so an unregistered NID hung any title calling it. RPCS3 aliases the
+  `CellHddGame*` structs to the `CellGameData` ones, so both entry points now
+  share one `gamedata_stat_callback()` helper.
 
 - `ps3recomp/tools/pkg_extract.py` — the debug/non-finalized keystream hashed the
   raw 0x40 bytes at header `0x60`. RPCS3 instead builds a 0x40-byte block as
