@@ -135,32 +135,86 @@ Two harmless oddities noted along the way:
 - `PS3_IMAGES/03_main_menu/main_menu_circles.texture.ps3` is requested but is
   genuinely not present in the package. A shipping bug in the title, not ours.
 
-### Where it stands
+### Chasing the stall
 
 The whole front-end loads, two draws go through, and then it parks. The watchdog
-samples the same last HLE call at both 8 s and 15 s:
+samples the same last HLE call at both 8 s and 15 s, so it is a spin, not a
+crash.
+
+Five NIDs were unresolved. Four fell out of a brute-force over the known export
+names (the NID is a hash of the function name, so candidates can just be
+enumerated and hashed):
+
+| NID | Library | Function |
+|---|---|---|
+| `0xF83F8182` | `sys_io` | `cellPadSetPressMode` |
+| `0xBE5BE3BA` | `sys_io` | `cellPadSetSensorMode` |
+| `0x56DFE179` | `cellAudio` | `cellAudioSetPortLevel` |
+| `0xDABBC2C0` | `sys_net` | `inet_addr` |
+| `0x9117DF20` | `cellSysutil` | **`cellHddGameCheck`** |
+
+`cellHddGameCheck` looked like the answer. It is asynchronous from the title's
+point of view: firmware runs the title's `funcStat` callback and the boot state
+machine waits on it, so an unregistered NID returns the fake `CELL_OK` default
+*without ever running the callback* and the title waits forever.
+
+RPCS3 defines `CellHddGameStatGet` / `StatSet` / `CBResult` as plain aliases of
+the `CellGameData` ones, so the RPCS3-verified struct layout already in
+`cellGameDataCheckCreate2` applies unchanged. Both entry points now share one
+`gamedata_stat_callback()` helper in `libs/system/cellGame.c`; only the log tag,
+the `isNewData` value and the error mapping differ.
+
+It works — the callback fires and returns OK:
 
 ```
-last HLE call = cellSysutilGetSystemParamInt
+[cellGame] HddGameCheck(version=0 dir='NPUB30003' funcStat=0x00153378)
+[cellGame] HddGameCheck: funcStat returned result=0
 ```
 
-so it is a spin, not a crash. Five NIDs remain unresolved, all peripheral:
+**It was not the blocker.** Still 2 draws. A real gap in the shared runtime,
+closed for every title that calls it, but not this hang.
 
-| NID | Library |
-|---|---|
-| `0xF83F8182` | `sys_io` |
-| `0xBE5BE3BA` | `sys_io` |
-| `0x9117DF20` | `cellSysutil` |
-| `0x56DFE179` | `cellAudio` |
-| `0xDABBC2C0` | `sys_net` |
+### The actual blocker
 
-The two `sys_io` ones are the immediate suspects: a front-end loop polling input
-through an import that returns nothing would spin exactly like this.
+Counting what repeats gave the shape: **2 `DRAW_ARRAYS`, 2 `CLEAR_SURFACE`, then
+59 iterations of `timer_usleep(2500 us)` from one fixed call site**,
+`lr=0x000E4518`. Disassembling the containing function (`0x000E4240`) made it
+plain:
+
+```
+000E4510  lwz  r3, -0x49E8(r2)
+000E4514  bl   0x14BD4C          ; sys_lwmutex_unlock
+000E4520  li   r3, 2500
+000E4524  li   r11, 141          ; sys_timer_usleep
+000E4528  sc
+000E452C  lwz  r29, -0x49B8(r2)
+000E4530  lwz  r0, 0(r29)        ; reload counter
+000E4538  cmpwi cr7, r0, 0
+000E453C  bgt  cr7, 0xE42D8      ; > 0 -> re-lock, go round again
+000E4540  ...                    ; else: cellAudioPortStop, store -1, return
+```
+
+Take a lightweight mutex, work, release, sleep 2.5 ms, repeat while a counter
+stays above zero — and the only exit calls **`cellAudioPortStop`**. This is an
+audio drain/wait. The front-end is waiting for sound work to complete before
+advancing past the logo sequence, and the counter never reaches zero.
+
+That makes `cellAudioSetPortLevel` (unimplemented, silently returning a fake
+`CELL_OK`) the prime suspect.
+
+> **A diagnostic trap worth recording.** The watchdog prints
+> `last HLE call = 0x1BC200F4 (cellSysutilGetSystemParamInt)`. NID `0x1BC200F4`
+> is actually **`sys_lwmutex_unlock`** in `sysPrxForUser` — the runtime's
+> watchdog name table mislabels it, and following the printed name leads into
+> `cellSysutil` and away from the audio loop entirely. Trust the NID, not the
+> label. Worth fixing upstream so the next port does not lose the same time.
 
 ### Next
 
-1. Identify the two `sys_io` NIDs and the `cellSysutil` one, and implement them.
-2. Confirm whether the spin is an input-poll loop by tracing the guest caller
-   around `cellSysutilGetSystemParamInt`.
-3. Get `rwt.sr` opening — nothing has touched the romset container yet, so the
-   emulator core has not started.
+1. Implement `cellAudioSetPortLevel`, `cellPadSetPressMode`, `cellPadSetSensorMode`
+   and `inet_addr` — all small, all genuine gaps in the shared runtime.
+2. Work out what decrements the counter at `-0x49B8(r2)` and why our `cellAudio`
+   path never drives it to zero. That is the hang.
+3. Fix the watchdog NID→name table so `0x1BC200F4` reports `sys_lwmutex_unlock`.
+4. Get `rwt.sr` opening — nothing has touched the romset container yet, so the
+   arcade emulator core has not started.

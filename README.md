@@ -29,28 +29,53 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current blocker
+### Current blocker — an audio drain loop
 
 The title loads its entire front-end (fonts, `strings.tsv`, the Digital Eclipse /
-Midway / legal logos, and every `FE_IMAGES` + `PS3_IMAGES` texture), issues two
-draws, then parks. The watchdog samples the same last HLE call at 8 s and 15 s:
+Midway / legal logos, and every `FE_IMAGES` + `PS3_IMAGES` texture), issues
+exactly **2 draws and 2 clears**, and then blocks forever.
+
+The loop is at guest `0x000E4240`, polling from `0x000E4518`:
 
 ```
-[WATCHDOG] 8s  sample; last HLE call = cellSysutilGetSystemParamInt
-[WATCHDOG] 15s sample; last HLE call = cellSysutilGetSystemParamInt
+000E4510  lwz  r3, -0x49E8(r2)
+000E4514  bl   0x14BD4C          ; sys_lwmutex_unlock
+000E4520  li   r3, 2500
+000E4524  li   r11, 141          ; sys_timer_usleep
+000E4528  sc                     ; sleep 2.5 ms
+000E452C  lwz  r29, -0x49B8(r2)
+000E4530  lwz  r0, 0(r29)        ; reload the counter
+000E4538  cmpwi cr7, r0, 0
+000E453C  bgt  cr7, 0xE42D8      ; still > 0 -> re-lock and go round again
+          ...                    ; falls through to cellAudioPortStop
 ```
 
-Five imports are still unresolved NIDs, all in peripheral libraries — two in
-`sys_io` (the input path a front-end loop would poll), one each in `cellSysutil`,
-`cellAudio` and `sys_net`:
+So it takes a lightweight mutex, does work, releases it, sleeps 2.5 ms, and
+repeats **while a counter stays above zero** — and the only way out calls
+`cellAudioPortStop`. That makes it an audio drain/wait: the front-end is waiting
+for sound work to finish before advancing past the logo sequence, and the
+counter never reaches zero.
 
-| NID | Library | Stub |
+`cellAudioSetPortLevel` is the prime suspect: the title calls it, our runtime
+has no handler, and it silently returns a fake `CELL_OK`.
+
+> **A diagnostic trap worth recording.** The watchdog reports
+> `last HLE call = 0x1BC200F4 (cellSysutilGetSystemParamInt)`. That NID is
+> **`sys_lwmutex_unlock`** in `sysPrxForUser` — the runtime's watchdog name table
+> mislabels it. Chasing the printed name leads into `cellSysutil` and away from
+> the actual audio loop. Trust the NID, not the label.
+
+### Remaining unresolved NIDs
+
+| NID | Library | Function |
 |---|---|---|
-| `0xF83F8182` | `sys_io` | `0x14C42C` |
-| `0xBE5BE3BA` | `sys_io` | `0x14C38C` |
-| `0x9117DF20` | `cellSysutil` | `0x14B46C` |
-| `0x56DFE179` | `cellAudio` | `0x14C22C` |
-| `0xDABBC2C0` | `sys_net` | `0x14BBEC` |
+| `0xF83F8182` | `sys_io` | `cellPadSetPressMode` |
+| `0xBE5BE3BA` | `sys_io` | `cellPadSetSensorMode` |
+| `0x56DFE179` | `cellAudio` | `cellAudioSetPortLevel` |
+| `0xDABBC2C0` | `sys_net` | `inet_addr` |
+
+`0x9117DF20` was **`cellHddGameCheck`** and is now implemented (see below); its
+callback fires and returns OK, but it was not the blocker.
 
 ---
 
