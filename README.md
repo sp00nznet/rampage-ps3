@@ -19,6 +19,7 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Identify the engine | ✅ Digital Eclipse "emutech" arcade emulator |
 | Function discovery + PPU lift | ✅ 5,104 detected → **5,117 lifted** |
 | SPU lift | ✅ 1 image (SCEE MultiStream 0.94), 637 functions |
+| SPU mixer executes real code | ✅ runs and parks at its idle poll |
 | Build on the shared ps3recomp harness | ✅ links clean, 21 MB TU |
 | First boot (recompiled CRT runs) | ✅ |
 | Reach `main()` / CRT init | ✅ |
@@ -29,32 +30,29 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current blocker - a dropped SPU mailbox write
+### Current blocker - the mixer idles on a channel we don't feed
 
-The title loads its entire front-end, issues **2 draws and 2 clears**, and then
-the main thread blocks forever. The chain is now fully traced:
+The title loads its whole front-end, issues **2 draws and 2 clears**, then the
+main thread blocks in `sys_event_queue_receive(q=2)` waiting for the MultiStream
+SPU mixer to answer.
+
+The PPU side of that conversation now works end to end:
 
 ```
-[SPU] group_start ... tid=0x2000 -> spawned host thread   <- MultiStream mixer running
-[rwh] #1 img=1 ctx=... entry=...                          <- lifted SPU image ran
-[ppu] lv2_syscall 190 (stub)                              <- sys_spu_thread_write_spu_mb: DROPPED
-[WAIT] event_queue_receive(q=2 timeout=0) tid=1 lr=0x000BC740   <- main blocks, forever
+[SPU] group_start ... tid=0x2000 -> spawned host thread
+[SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> re-running worker
+[worker] spu=0x2000 halted=1 steps=12 status=0x0 inmbox(n=1) outmbox(n=0) outintr(n=0)
 ```
 
-Main hands work to the MultiStream SPU by writing its inbound mailbox
-(`sys_spu_thread_write_spu_mb`, lv2 syscall **190**), then waits on event queue 2
-for the SPU to report back. The SPU's outbound events are bound to that very
-queue (`thread_connect_event tid=0x2000 queue=0x2`). Syscall 190 is the **only**
-SPU-thread syscall missing from an otherwise complete registration table, so the
-message is dropped, the mixer is never told to do anything, no completion event
-is posted, and main waits for a wake that cannot come.
+`halted=1` means the worker reached an idle channel poll and **parked** cleanly
+rather than falling over - it is executing real lifted SPU code. But
+`inmbox(n=1)` says our command word is still sitting unread in its inbound
+mailbox when it parks. So the mixer idles on some *other* channel (a signal
+notification, an SPU event, or `sys_spu_thread_receive_event`) and only consults
+the mailbox later in its protocol. Finding which channel it actually waits on is
+the next step.
 
-**Next step.** Implementing 190 needs a `tid -> spu_context*` registry: the
-context is a stack local inside `spu_run_lifted_job_abi`, so nothing outside can
-reach `ctx->ch_in_mbox` today. It also raises a real design question - the
-MultiStream mixer is a *persistent worker* that blocks on `rdch SPU_RdInMbox`,
-whereas the runtime's lifted-SPU model is job-shaped (enter, drain, finish). That
-is a change to the SPU execution model, not a one-line syscall.
+Until it answers, no completion event reaches queue 2 and main never wakes.
 
 ### Remaining unresolved NIDs
 
@@ -64,9 +62,6 @@ is a change to the SPU execution model, not a one-line syscall.
 | `0xBE5BE3BA` | `sys_io` | `cellPadSetSensorMode` |
 | `0x56DFE179` | `cellAudio` | `cellAudioSetPortLevel` |
 | `0xDABBC2C0` | `sys_net` | `inet_addr` |
-
-`cellAudioSetPortLevel` is the only one of the title's 8 `cellAudio` imports not
-covered; the other seven are implemented.
 
 ---
 
@@ -203,6 +198,15 @@ PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
 
 ### Gotchas found the hard way
 
+- **`spu_lifter.py` does NOT parse ELF program headers.** A positional input is
+  treated as a FLAT local-store blob, with file offset mapped to LS address via
+  `--offset`/`--base`. This image's `.text` is at file `0x100` / LS `0x80`, so
+  handing the ELF over directly lifted the **ELF header as code**: LS `0x90`
+  decoded the header word `0x00000004` as `stop 4`, and the entry function came
+  out as a single stop instruction. It fails *silently* - 637 functions are still
+  reported lifted, and the SPU simply halts the instant it is dispatched. Use
+  `--auto-functions <elf>` instead, which runs the same ELF parse
+  `find_spu_functions.py` uses.
 - **The title loads its content twice, by two different paths.** Early boot uses
   RELATIVE paths (`strings.tsv`, `fonts/Font_M.rf`, `uiresource.txt`), so
   `PS3_VFS_ROOT` must point at `USRDIR`. Then, once `cellHddGameCheck` reports the
@@ -223,6 +227,19 @@ PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
   expected to be absent on a first run.
 
 ## 🔧 Upstream fixes made for this port
+
+- `runtime/syscalls/lv2_register.c` - **`sys_spu_thread_write_spu_mb` (lv2
+  syscall 190) implemented.** It was the only SPU-thread syscall missing from an
+  otherwise complete registration table, so PPU-to-SPU mailbox words were
+  silently dropped. Delivered by re-running the parked worker with the word
+  pre-loaded.
+- `runtime/spu/spu_lifted_job.h` - lifted SPU runs gained a `spu_run_opts` for
+  RAW SPU THREADS (jobs pass `NULL` and are unaffected): inbound-mailbox
+  pre-load, park-on-empty-inbox, and - importantly - **`spu_id`, which the lifted
+  path never set**. Without it an outbound mailbox word cannot be matched back to
+  an lv2 SPU thread, so the completion event is dropped and the PPU waits
+  forever. The interpreter path already set it; the lifted path did not. Adds a
+  one-per-run completion signal and an `SPU_WORKER_TRACE` run summary.
 
 - `runtime/syscalls/sys_cond.c` - **`sys_cond_signal_to` (lv2 syscall 110) was
   never registered**, the only member of the condvar family missing, so it hit

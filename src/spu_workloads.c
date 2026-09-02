@@ -11,7 +11,7 @@
 
 extern void spu_begin_image(int image_id);
 
-extern void msng_spu_func_00000080(spu_context*);
+extern void msng_spu_func_00000090(spu_context*);
 extern void msng_spu_recomp_register(void);
 
 void rampage_spu_register_all(void)
@@ -25,8 +25,13 @@ void rampage_spu_register_all(void)
      * 0xF92BC94C97BE3985 and the image silently never dispatches --
      * "is NOT in the workload registry ... 1 had no fallback". If this ever
      * drifts, the runtime prints the fingerprint it actually wants. */
+    /* Entry is LS 0x90, NOT 0x80. find_spu_functions reports the text segment
+     * as starting at 0x80, but that first "function" is a lone `stop` word of
+     * padding -- registering it ran the mixer as: enter, stop, done (status
+     * 0x2, mailbox never read, no reply). The image's real entry is the one
+     * _sys_spu_image_import prints: "entry=0x00090". */
     spu_begin_image(1); msng_spu_recomp_register();
-    spu_workload_register_img(0xE82F0FE56D1B967BULL, msng_spu_func_00000080,
+    spu_workload_register_img(0xE82F0FE56D1B967BULL, msng_spu_func_00000090,
                               1, "scee_multistream_0.94");
 }
 

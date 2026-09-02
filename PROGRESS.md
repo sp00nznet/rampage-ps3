@@ -290,19 +290,99 @@ the package.
 Boots, renders, loads its entire front-end from the correct HDD path, spawns and
 runs the lifted MultiStream SPU mixer. Blocks on one missing syscall.
 
+### Session 1b - wiring the SPU mixer
+
+**`sys_spu_thread_write_spu_mb` (syscall 190) implemented.** The word is
+delivered by re-running the parked worker with it pre-loaded, which is the shape
+the interpreter path already used for per-frame work descriptors. Run
+synchronously: the caller's next move is `sys_event_queue_receive` on the queue
+the worker replies to, and a host thread racing that is how completion events get
+lost.
+
+**The lifted path could never have woken the PPU anyway.**
+`spu_run_lifted_job_abi` never set `ctx.spu_id`. Without it an outbound mailbox
+word cannot be matched back to an lv2 SPU thread, so the completion event is
+dropped on the floor. The interpreter path sets it and carries a comment saying
+exactly why; the lifted path simply did not. Raw SPU threads now pass a
+`spu_run_opts` carrying `spu_id`/`group_id`, the inbound mailbox word, and
+park-on-empty-inbox. SPURS jobs pass `NULL` and behave exactly as before.
+
+### The SPU lift was garbage, and it failed silently
+
+With all that wired, the mixer still did nothing. An `SPU_WORKER_TRACE` run
+summary gave the answer:
+
+```
+[worker] spu=0x2000 steps=0 status=0x2 pc=0x00000 inmbox(n=1) outmbox(n=0)
+```
+
+`status=0x2` is `STOPPED_BY_STOP`: the SPU ran and hit a `stop` instruction
+immediately. Looking at the lifted entry explained why - it was one instruction
+long:
+
+```c
+void msng_spu_func_00000090(spu_context* ctx) {
+        ctx->stop_code = 0x4u; ctx->status = SPU_STATUS_STOPPED_BY_STOP; spu_stop(ctx); return;
+}
+```
+
+`spu_lifter.py` does not parse ELF program headers. A positional input is a FLAT
+local-store blob, with file offset mapped to LS address by `--offset`/`--base`.
+This image's `.text` sits at file `0x100` / LS `0x80`, so passing the ELF
+directly lifted the **ELF header itself as code**: LS `0x80` decoded the header
+word `0x00000000` as `stop 0`, LS `0x90` decoded `0x00000004` as `stop 4`. Both
+"entry points" were header bytes.
+
+What makes this worth writing down is how quiet it is. The tool reported *637
+functions lifted, 89.3% coverage* and exited 0. `find_spu_functions.py` had
+parsed the ELF correctly and printed `Text segment: va=0x80 .. 0xCBD0`, so
+every number on screen looked right. Nothing anywhere said the two tools
+disagreed about what a file offset meant.
+
+`--auto-functions <elf>` runs the same ELF parse `find_spu_functions` uses.
+Re-lifted, the entry becomes real code:
+
+```c
+void msng_spu_func_00000090(spu_context* ctx) {
+        ctx->gpr[8] = spu_ila(0x3FFD0);          /* stack top - a real SPU CRT entry */
+        { ctx->pc = 0x94; g_spu_trampoline_fn = msng_spu_func_00000094; return; }
+}
+```
+
+`tools/relift.sh` fixed to match.
+
+> A related false trail: the runtime reported the image's fingerprint as
+> `0xE82F0FE56D1B967B` while the extracted file hashes to `0xF92BC94C97BE3985`,
+> which looked like the extractor rewriting bytes. It is not - the extracted file
+> is **byte-identical** to the raw EBOOT slice. The guest image is patched in
+> memory before `group_start` (a version word, most likely, given MultiStream's
+> PPU/SPU version handshake). Register the fingerprint the runtime prints; lift
+> from the file.
+
+### Where it stands
+
+```
+[SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> re-running worker
+[worker] spu=0x2000 halted=1 steps=12 status=0x0 inmbox(n=1) outmbox(n=0) outintr(n=0)
+```
+
+`halted=1` means the worker now reaches an idle channel poll and **parks**
+cleanly - it is executing real lifted SPU code. But `inmbox(n=1)`: our command
+word is still unread when it parks. The mixer idles on some *other* channel and
+only consults the mailbox later in its protocol.
+
 ### Next
 
-1. **Implement `sys_spu_thread_write_spu_mb` (syscall 190).** This needs a
-   `tid -> spu_context*` registry: the context is a stack local inside
-   `spu_run_lifted_job_abi`, so nothing outside can reach `ctx->ch_in_mbox`
-   today. It also raises a real design question - the MultiStream mixer is a
-   *persistent worker* that blocks on `rdch SPU_RdInMbox`, while the runtime's
-   lifted-SPU model is job-shaped (enter, drain, finish). Expect to touch the
-   SPU execution model, not just add a syscall.
-2. Implement the four remaining NIDs: `cellAudioSetPortLevel` (the only one of
-   the title's 8 `cellAudio` imports not covered), `cellPadSetPressMode`,
-   `cellPadSetSensorMode`, `inet_addr`.
-3. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
-   `sys_lwmutex_unlock`. It cost real time here and will cost it again.
-4. Get `rwt.sr` opening - nothing has touched the romset container yet, so the
+1. **Find which channel the mixer actually idles on.** It parks with a full
+   inbox, so it is waiting on a signal notification, an SPU event, or
+   `sys_spu_thread_receive_event` - not `SPU_RdInMbox`. Tracing channel reads
+   over the 12 drain steps should name it directly.
+2. A parked worker restarts from its ENTRY, not from where it parked (local store
+   persists, registers do not). If MultiStream's init turns out not to be
+   idempotent, the park will need to save and restore the register file.
+3. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
+   `cellPadSetPressMode`, `cellPadSetSensorMode`, `inet_addr`.
+4. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
+   `sys_lwmutex_unlock`.
+5. Get `rwt.sr` opening - nothing has touched the romset container yet, so the
    arcade emulator core has not started.

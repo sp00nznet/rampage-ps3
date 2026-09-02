@@ -34,8 +34,15 @@ python "$PS3RECOMP/tools/gen_hle_nids.py" --all --out src/gen/ppu_hle_nids.cpp
 mkdir -p spu_dump
 python "$PS3RECOMP/tools/extract_spu_images.py" game/EBOOT.elf -o spu_dump
 SPU_ELF=spu_dump/spu_0000_at_00167B80.elf
-python "$PS3RECOMP/tools/find_spu_functions.py" "$SPU_ELF" --out spu_dump/msng_funcs.json
+# --auto-functions, NOT a positional input. spu_lifter.py treats a positional
+# argument as a FLAT local-store blob and maps file offset -> LS address via
+# --offset/--base; it does not read ELF program headers. Handing it this ELF
+# directly lifted the ELF HEADER as code: .text lives at file 0x100 / LS 0x80,
+# so LS 0x90 decoded the header word 0x00000004 as `stop 4` and the entry
+# function came out as a single stop instruction. It fails SILENTLY -- 637
+# functions are still reported lifted -- and the SPU halts instantly at every
+# dispatch. --auto-functions runs find_spu_functions' ELF parse and lifts the
+# real text segment.
 rm -rf src/spu_gen/msng && mkdir -p src/spu_gen/msng
-python "$PS3RECOMP/tools/spu_lifter.py" "$SPU_ELF" \
-    --functions spu_dump/msng_funcs.json \
+python "$PS3RECOMP/tools/spu_lifter.py" --auto-functions "$SPU_ELF" \
     --symbol-prefix msng_ -o src/spu_gen/msng
