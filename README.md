@@ -10,7 +10,7 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 
 ## 🎯 Status
 
-**Boots, renders, loads its whole front-end.** Stalls before the menu draws.
+**Boots, renders, and the audio mixer is live.** Draws are flowing; a mailbox flood now throttles progress.
 
 | Milestone | Status |
 |---|---|
@@ -26,47 +26,40 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | D3D12 backend up | ✅ live NV4097 → D3D12 |
 | MultiStream SPU thread runs | ✅ `SPU thread started successfully` |
 | Front-end assets load | ✅ fonts, strings, logos, every menu texture |
-| Menus render | ❌ **stalls after 2 draws** |
+| SPU mixer answers the PPU | ✅ live worker, real command/reply traffic |
+| Menus render | ⚠️ 20 draws and climbing (was 2) |
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current blocker - the mixer inits and parks, but never answers
+### Current blocker - the PPU floods the SPU mailbox
 
-The title loads its whole front-end, issues **2 draws and 2 clears**, then main
-blocks in `sys_event_queue_receive(q=2)` waiting for the MultiStream SPU mixer.
-
-The whole PPU->SPU path now works:
+The MultiStream mixer is now a **live persistent worker**: it blocks inside
+`rdch` on its own host thread, the PPU pokes its mailbox with
+`sys_spu_thread_write_spu_mb`, it wakes where it stood with its registers
+intact, does the work, and writes back.
 
 ```
-[SPU] thread tid=0x2000 local store loaded (entry 0x00090)
-[SPU] group_start id=0x1000 tid=0x2000 -> spawned host thread
-[SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> re-running worker
-[worker] spu=0x2000 halted=1 steps=546 status=0x0 pc=0x00260 inmbox(n=0) outmbox(n=0)
+[SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> live worker
+[SPU->PPU] mbox deliver spu=0x2000 intr=0 val=0x00000001 -> q=2
+[SPU->PPU] mbox deliver spu=0x2000 intr=1 val=0x2A000001 -> q=2
 ```
 
-The mixer runs ~546 lifted control transfers of real init, then **parks** on an
-empty inbound mailbox (`halted=1`) - the intended persistent-worker behaviour.
-What it never does is write an outbound word, so no completion event reaches
-queue 2 and main never wakes.
+That took draws from **2 to 20** and RSX draws from 2 to 32.
 
-Open question: whether `0xFFDD` is being consumed as a command at all, and what
-handshake the mixer expects before it will reply. Note the worker restarts from
-its ENTRY on each re-run (local store persists, registers do not), so a protocol
-that depends on register state surviving an idle-park would not work yet.
+What is left is a throughput mismatch. A second game thread (tid 5) writes the
+same command in a tight loop and waits on queue 2 for each reply:
 
-> **Instrumentation note.** `SPU_CHHIST` instruments `spu_wrch` and `spu_rdch`
-> but **not** `spu_rchcnt` - which is exactly where the park lives. An empty
-> channel histogram therefore does not mean "touches no channels"; a worker that
-> polls `rchcnt(SPU_RdInMbox)` and parks is invisible to it.
+```
+[SPU] write_spu_mb tid=0x2000 val=0x102F2780 -> live worker
+[WAIT] event_queue_receive(q=2 timeout=0) tid=5 cia=0x00153808
+```
 
-### Remaining unresolved NIDs
-
-| NID | Library | Function |
-|---|---|---|
-| `0xF83F8182` | `sys_io` | `cellPadSetPressMode` |
-| `0xBE5BE3BA` | `sys_io` | `cellPadSetSensorMode` |
-| `0x56DFE179` | `cellAudio` | `cellAudioSetPortLevel` |
-| `0xDABBC2C0` | `sys_net` | `inet_addr` |
+**42,562 mailbox writes produced only 32 replies.** The SPU inbound mailbox is
+only a few words deep, so writes arriving faster than the worker drains them are
+being lost. On hardware `sys_spu_thread_write_spu_mb` reports a full mailbox
+rather than silently dropping, and the writer retries - so the next step is
+honouring mailbox depth (and returning EBUSY when full) instead of always
+accepting the write.
 
 ---
 
@@ -232,6 +225,21 @@ PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
   expected to be absent on a first run.
 
 ## 🔧 Upstream fixes made for this port
+
+- `runtime/syscalls/lv2_register.c` - **SPU thread events are routed per SPU
+  PORT.** `sys_spu_thread_connect_event(id, eq, et, spup)` binds one queue per
+  port and a thread commonly has several; the handler kept a single
+  `connected_queue`, so a later bind clobbered an earlier one. MultiStream binds
+  port `0x2A` to its command/completion queue and port `0x01` to its printf
+  queue, and lv2 encodes the destination port in the **top byte** of the word the
+  SPU sends back (`0x2A000001`). Every reply was going to the printf server while
+  the PPU waited on the command queue. The handler also stored `et` into a field
+  named `connect_spup` and never read the real `spup` argument at all.
+- `runtime/syscalls/spu_lifted_fallback.c` - raw SPU workers now **block** on an
+  empty mailbox (`g_spu_force_ch_block`, the same switch `spu_raw.c` uses) rather
+  than parking. Blocking keeps the host thread's C stack alive, so the SPU's
+  registers survive the wait; park-and-restart re-ran init from the entry and
+  swallowed the next command as a startup parameter.
 
 - `runtime/syscalls/lv2_register.c` - **a raw SPU thread's local store was never
   loaded.** The SPURS/workload dispatch paths call `spu_elf_load_to_ls` before

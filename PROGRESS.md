@@ -417,22 +417,82 @@ The mixer inits properly and parks on an empty mailbox - the intended
 persistent-worker behaviour. It just never writes an outbound word, so no
 completion event reaches queue 2 and main stays blocked.
 
+### Session 1d - the mixer comes alive
+
+Two fixes, and the second one is the whole game.
+
+**Block, do not park.** Park-and-restart could never work for a persistent
+worker: local store survives a park but registers do not, so each re-run
+re-executed 546 hops of init and consumed the next command as though it were a
+startup parameter. The runtime already had the right mechanism - `spu_ch_wait` /
+`spu_ch_wake` and the `g_spu_force_ch_block` switch that `spu_raw.c` sets for
+exactly this shape ("a raw SPU on its own host thread against a PPU that pokes
+its mailboxes"). Blocking inside `rdch` keeps the host thread's C stack alive, so
+the SPU's register state survives the wait for free. The live context is
+published per thread so `sys_spu_thread_write_spu_mb` can write the mailbox and
+wake the worker where it stands.
+
+That made the mixer reply for the first time:
+
+```
+[SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> live worker
+[SPU->PPU] mbox deliver spu=0x2000 intr=0 val=0x00000001 -> q=3
+[SPU->PPU] mbox deliver spu=0x2000 intr=1 val=0x2A000001 -> q=3
+```
+
+...to the wrong queue. Main was waiting on **q=2**.
+
+**Route SPU events by SPU PORT.** The real signature is
+`sys_spu_thread_connect_event(id, eq, et, spup)` - one queue per *port*, and a
+thread commonly binds several. Our handler kept a single `connected_queue`, so
+the second bind clobbered the first. It also stored `et` into a field named
+`connect_spup` and never read the actual `spup` argument, which is why both binds
+looked identical in the log. Printing r6 settled it instantly:
+
+```
+thread_connect_event tid=0x2000 queue=0x2 et=0x1 spup=0x2A   <- command/completion
+thread_connect_event tid=0x2000 queue=0x3 et=0x1 spup=0x1    <- printf server
+```
+
+And the completion word the SPU had been sending all along was **`0x2A000001`** -
+top byte `0x2A`, the destination port. lv2 encodes the target port in the high
+bits; we were ignoring it and delivering everything to whichever queue was bound
+last. Routing on `(value >> 24)`, with the first binding kept as the fallback for
+words that are not port-addressed:
+
+```
+[SPU->PPU] mbox deliver spu=0x2000 intr=1 val=0x2A000001 -> q=2
+```
+
+**Draws went from 2 to 20**, RSX draws from 2 to 32, and the PPU/SPU exchange
+became a real conversation across three distinct commands with a fifth game
+thread joining in.
+
+### Where it stands
+
+A throughput mismatch, which is a much better problem than a deadlock. Game
+thread 5 writes the same command in a tight loop and waits on queue 2 for each
+reply:
+
+```
+[SPU] write_spu_mb tid=0x2000 val=0x102F2780 -> live worker
+[WAIT] event_queue_receive(q=2 timeout=0) tid=5 cia=0x00153808
+```
+
+**42,562 mailbox writes, 32 replies.** The SPU inbound mailbox is only a few
+words deep, so writes arriving faster than the worker drains them are being lost.
+
 ### Next
 
-1. **Work out the mixer's handshake.** It parks without replying. Determine
-   whether `0xFFDD` is consumed as a command and what it expects before it will
-   answer. Instrumenting `spu_rchcnt` (the current blind spot) is the cheapest
-   way to see what it actually polls.
-2. A parked worker restarts from its ENTRY, not from where it parked - local
-   store persists, registers do not. If MultiStream's protocol carries state in
-   registers across an idle-park, the park will need to save and restore the
-   register file.
-3. There is a race worth removing: `group_start` spawns the worker on a host
-   thread while `write_spu_mb` runs it synchronously, so two runs can overlap and
-   either may consume the pending mailbox word.
-4. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
+1. **Honour SPU mailbox depth.** `sys_spu_thread_write_spu_mb` currently always
+   accepts the write; hardware reports a full mailbox instead, and the writer
+   retries - which is exactly what thread 5 is already doing. Returning EBUSY on
+   a full inbox should convert the flood into proper back-pressure.
+2. Check whether every command actually warrants a reply, or whether the worker
+   is replying correctly and only the dropped writes are missing.
+3. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
    `cellPadSetPressMode`, `cellPadSetSensorMode`, `inet_addr`.
-5. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
+4. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
    `sys_lwmutex_unlock`.
-6. Get `rwt.sr` opening - nothing has touched the romset container yet, so the
+5. Get `rwt.sr` opening - the romset container still has not been touched, so the
    arcade emulator core has not started.
