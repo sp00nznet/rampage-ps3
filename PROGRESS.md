@@ -371,18 +371,68 @@ cleanly - it is executing real lifted SPU code. But `inmbox(n=1)`: our command
 word is still unread when it parks. The mixer idles on some *other* channel and
 only consults the mailbox later in its protocol.
 
+### Session 1c - the local store was never loaded
+
+With the lift fixed and the mailbox syscall in place, the mixer still did
+essentially nothing: 12 lifted control transfers and an immediate return
+(`branch to LS 0 -- job complete`).
+
+The cause turned out to be the plainest thing possible. `spu_elf_load_to_ls` is
+called by the SPURS/workload dispatch paths before running a job, but the raw
+`sys_spu_thread_*` path never called it, and this title never calls
+`sys_spu_thread_write_ls` itself. Lifting supplies the **instructions**;
+everything else the code needs - `.data`, `.rodata`, jump tables, the stack area
+- lives in local store. The worker was executing real recompiled SPU code
+against 256 KB of zeroes.
+
+Loading the image into the thread's local store once at `group_start` (re-runs
+must keep whatever the worker has built up, not reset it):
+
+```
+[SPU] thread tid=0x2000 local store loaded (entry 0x00090)
+[worker] spu=0x2000 halted=1 steps=546 status=0x0 pc=0x00260
+```
+
+**12 -> 546** control transfers, and `pc` finally lands somewhere meaningful.
+
+### A blind spot in the channel histogram
+
+The worker showed zero channel activity even at `SPU_CHHIST=25`, which read as
+"never talks to a channel". Two things were wrong with that reading.
+
+First, `SPU_CHHIST` was hardcoded to dump every 2000 accesses, so a worker doing
+a few hundred printed nothing whatsoever - "below threshold" and "no activity"
+looked identical. It now takes an interval.
+
+Second, and the actual explanation: `SPU_CHHIST` instruments `spu_wrch` and
+`spu_rdch` but **not `spu_rchcnt`** - which is precisely where
+`park_on_empty_inmbox` lives. A worker that polls `rchcnt(SPU_RdInMbox)`, finds
+it empty and parks is completely invisible to the histogram. The mixer is doing
+exactly that, and the absence of any `job complete` marker confirms it: it is
+parking, not returning.
+
+### Where it stands
+
+The mixer inits properly and parks on an empty mailbox - the intended
+persistent-worker behaviour. It just never writes an outbound word, so no
+completion event reaches queue 2 and main stays blocked.
+
 ### Next
 
-1. **Find which channel the mixer actually idles on.** It parks with a full
-   inbox, so it is waiting on a signal notification, an SPU event, or
-   `sys_spu_thread_receive_event` - not `SPU_RdInMbox`. Tracing channel reads
-   over the 12 drain steps should name it directly.
-2. A parked worker restarts from its ENTRY, not from where it parked (local store
-   persists, registers do not). If MultiStream's init turns out not to be
-   idempotent, the park will need to save and restore the register file.
-3. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
+1. **Work out the mixer's handshake.** It parks without replying. Determine
+   whether `0xFFDD` is consumed as a command and what it expects before it will
+   answer. Instrumenting `spu_rchcnt` (the current blind spot) is the cheapest
+   way to see what it actually polls.
+2. A parked worker restarts from its ENTRY, not from where it parked - local
+   store persists, registers do not. If MultiStream's protocol carries state in
+   registers across an idle-park, the park will need to save and restore the
+   register file.
+3. There is a race worth removing: `group_start` spawns the worker on a host
+   thread while `write_spu_mb` runs it synchronously, so two runs can overlap and
+   either may consume the pending mailbox word.
+4. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
    `cellPadSetPressMode`, `cellPadSetSensorMode`, `inet_addr`.
-4. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
+5. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
    `sys_lwmutex_unlock`.
-5. Get `rwt.sr` opening - nothing has touched the romset container yet, so the
+6. Get `rwt.sr` opening - nothing has touched the romset container yet, so the
    arcade emulator core has not started.

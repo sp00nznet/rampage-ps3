@@ -30,29 +30,34 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current blocker - the mixer idles on a channel we don't feed
+### Current blocker - the mixer inits and parks, but never answers
 
-The title loads its whole front-end, issues **2 draws and 2 clears**, then the
-main thread blocks in `sys_event_queue_receive(q=2)` waiting for the MultiStream
-SPU mixer to answer.
+The title loads its whole front-end, issues **2 draws and 2 clears**, then main
+blocks in `sys_event_queue_receive(q=2)` waiting for the MultiStream SPU mixer.
 
-The PPU side of that conversation now works end to end:
+The whole PPU->SPU path now works:
 
 ```
-[SPU] group_start ... tid=0x2000 -> spawned host thread
+[SPU] thread tid=0x2000 local store loaded (entry 0x00090)
+[SPU] group_start id=0x1000 tid=0x2000 -> spawned host thread
 [SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> re-running worker
-[worker] spu=0x2000 halted=1 steps=12 status=0x0 inmbox(n=1) outmbox(n=0) outintr(n=0)
+[worker] spu=0x2000 halted=1 steps=546 status=0x0 pc=0x00260 inmbox(n=0) outmbox(n=0)
 ```
 
-`halted=1` means the worker reached an idle channel poll and **parked** cleanly
-rather than falling over - it is executing real lifted SPU code. But
-`inmbox(n=1)` says our command word is still sitting unread in its inbound
-mailbox when it parks. So the mixer idles on some *other* channel (a signal
-notification, an SPU event, or `sys_spu_thread_receive_event`) and only consults
-the mailbox later in its protocol. Finding which channel it actually waits on is
-the next step.
+The mixer runs ~546 lifted control transfers of real init, then **parks** on an
+empty inbound mailbox (`halted=1`) - the intended persistent-worker behaviour.
+What it never does is write an outbound word, so no completion event reaches
+queue 2 and main never wakes.
 
-Until it answers, no completion event reaches queue 2 and main never wakes.
+Open question: whether `0xFFDD` is being consumed as a command at all, and what
+handshake the mixer expects before it will reply. Note the worker restarts from
+its ENTRY on each re-run (local store persists, registers do not), so a protocol
+that depends on register state surviving an idle-park would not work yet.
+
+> **Instrumentation note.** `SPU_CHHIST` instruments `spu_wrch` and `spu_rdch`
+> but **not** `spu_rchcnt` - which is exactly where the park lives. An empty
+> channel histogram therefore does not mean "touches no channels"; a worker that
+> polls `rchcnt(SPU_RdInMbox)` and parks is invisible to it.
 
 ### Remaining unresolved NIDs
 
@@ -227,6 +232,17 @@ PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
   expected to be absent on a first run.
 
 ## 🔧 Upstream fixes made for this port
+
+- `runtime/syscalls/lv2_register.c` - **a raw SPU thread's local store was never
+  loaded.** The SPURS/workload dispatch paths call `spu_elf_load_to_ls` before
+  running a job; the raw `sys_spu_thread_*` path did not, and a title that starts
+  a plain SPU thread group does not write LS itself. Lifting supplies the
+  instructions, but `.data`, `.rodata`, jump tables and the stack area all live
+  in local store - so the worker ran against 256 KB of zeroes. Loading it took
+  the MultiStream mixer from 12 lifted control transfers to 546.
+- `runtime/spu/spu_channels.c` - `SPU_CHHIST` takes an interval
+  (`SPU_CHHIST=25`); it was hardcoded to dump every 2000 accesses, so a
+  short-lived worker never printed anything at all.
 
 - `runtime/syscalls/lv2_register.c` - **`sys_spu_thread_write_spu_mb` (lv2
   syscall 190) implemented.** It was the only SPU-thread syscall missing from an
