@@ -32,54 +32,29 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current status - the logo sequence plays
+### Current status - logo sequence plays, romset opened, attract not reached
 
-Confirmed on screen, not inferred from counters: the title boots into its logo
-sequence and plays through it - the **Midway legal screen**, the **Backbone
-logo**, and the rest of the boot logos. One logo does not render correctly; the
-others look right.
+The title boots, plays its logo sequence on screen (Midway legal, Backbone, and
+the rest), and gets as far as **opening `rwt.sr`** - the 38 MB romset container
+the arcade emulator interprets. It does not read from it yet, so the arcade core
+has not started and attract mode is not reached.
 
-That is the first visual confirmation the recompiled title is producing real
-frames, and it lands well past the point where it used to deadlock.
+Rendering is now deterministic. Two consecutive runs:
 
-Underneath it, the MultiStream mixer is a live persistent worker: it blocks
-inside `rdch` on its own host thread, the PPU pokes its mailbox with
-`sys_spu_thread_write_spu_mb`, and it wakes where it stood with registers intact,
-works, and replies to the right queue.
-
-Three consecutive runs of the same binary:
-
-| run | draw log lines | RSX log lines | PPU threads | mailbox BUSY | worker re-runs |
+| run | draw log lines | `rwt.sr` opened | mailbox waits | failed writes | PPU threads |
 |---|---|---|---|---|---|
-| 1 | 10 | 10 | 5 | 1 | 0 |
-| 2 | 10 | 10 | 5 | 1 | 0 |
-| 3 | 24 (capped) | 32 (capped) | 5 | 2731 | 0 |
+| 1 | 24 (capped) | yes | 8 | 0 | 5 |
+| 2 | 24 (capped) | yes | 4 | 0 | 5 |
 
-**Read that table carefully - those are log lines, not draws.** Both counters are
-capped: the D3D12 one logs its first 20 calls then every 1000th, and the RSX one
-stops after 32. So run 1 and run 2 really did issue only ten draws and stalled,
-while run 3 saturated both caps - 24 lines means roughly *four thousand* draws,
-which is the run that actually plays the logo sequence.
+Both saturate the draw-log cap, which is roughly four thousand real draws. Before
+the mailbox fix, two runs in three stalled after ten draws.
 
-The spread between runs is therefore enormous (ten draws versus thousands), not
-the mild 10-vs-24 jitter the raw numbers suggest. A saturating counter is not a
-measurement.
-
-`re-runs = 0` is the column that matters: the worker is always alive when the PPU
-writes to it, so no command is ever delivered by restarting it from its entry.
-Some runs stall after ten draws and others render the whole sequence, so
-something downstream is still timing-dependent.
-
-**Known visual bug:** one logo in the boot sequence draws incorrectly while the
-rest are fine. Worth pinning down which one - a single bad logo among correct
-ones usually means one texture format or swizzle case, not a broken pipeline.
-
-> **A measurement lesson.** An earlier build reached 20 draws and looked like a
-> win. It was not: the mailbox path was logging *every* write, and 42,562
-> `fprintf`+`fflush` calls were slowing the PPU just enough for the SPU worker to
-> win a race it normally lost. Removing the logging dropped it straight back to
-> 2 draws. The real fix was a start handshake, not the logging. Any result that
-> depends on how much you are printing is not a result.
+**Where it stops.** The MultiStream worker is alive and blocked in `rdch` at LS
+`0x015B8` waiting for its next command, while game thread 5 waits on event queue
+2 for a reply. The worker does reply - the same
+`intr=0 val=0x00000001` / `intr=1 val=0x2A000001` pair each time - so the reply
+thread 5 is waiting for is not the one it is getting. That protocol layer is the
+next thing to work out.
 
 ---
 
@@ -245,6 +220,23 @@ PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
   expected to be absent on a first run.
 
 ## 🔧 Upstream fixes made for this port
+
+- `runtime/syscalls/lv2_register.c` - **a full SPU mailbox now WAITS instead of
+  being refused.** Returning `CELL_EBUSY` looked right (it is what hardware
+  does), but the two callers disagree: one retries, spinning thousands of times
+  and stealing CPU from the renderer, while the other writes once, treats the
+  error as "sent", and goes straight to `sys_event_queue_receive` - deadlocking,
+  because the worker is waiting for the command that was just refused. Waiting
+  briefly for the slot drops no command and lets a would-be spinner sleep.
+  Bounded at 250 ms so a wedged worker degrades to `EBUSY` rather than hanging
+  the PPU thread. A faithful 4-deep inbox FIFO would be better still.
+- `runtime/ppu/tests/boot_main.cpp` - **PARAM.SFO is looked for in more than one
+  place**, and the window caption uses the title it finds. The path was built as
+  `<vfs root>/PS3_GAME/PARAM.SFO`, which is wrong whenever the root is `USRDIR`
+  (needed by any title that opens content by relative path). The SFO was then
+  silently missed, so the title id fell back to `BLES00000` - sending saves to a
+  directory belonging to no game - and the window caption fell back to a
+  hardcoded name from a different port.
 
 - `runtime/syscalls/lv2_register.c` - **worker start handshake.**
   `sys_spu_thread_group_start` now waits (bounded) for a spawned persistent

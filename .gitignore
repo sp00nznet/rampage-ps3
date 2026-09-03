@@ -23,8 +23,6 @@ build/
 *.exe
 
 # Transient run logs
-_boot*.out
-_boot*.err
 hdd0/
 
 # Stray decrypted executables and run logs (never commit game code)
@@ -32,7 +30,7 @@ hdd0/
 *.elf
 *.self
 *.BIN
-_r*.out
-_r*.err
-_h*.out
-_h*.err
+
+# Run logs: any _name.out/.err scratch capture at the repo root
+_*.out
+_*.err

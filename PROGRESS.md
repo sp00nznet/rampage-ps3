@@ -554,25 +554,82 @@ The logo sequence plays, but not on every run: some stall after ten draws
 while others render thousands. Progress is still timing-dependent, and the
 user reports the logos advance slowly even on a good run.
 
+### Session 1f - toward attract mode
+
+**The window said the wrong game.** The caption came from `$PS3_TITLE` with a
+hardcoded fallback naming a different port. `cellGame` already parses `TITLE` out
+of PARAM.SFO, so the caption now uses that, with a neutral `ps3recomp` as the
+last resort.
+
+Except it still did not work, and the reason mattered more than the caption:
+
+```
+[cellGame] PARAM.SFO not read ('vfs/PS3_GAME/USRDIR/PS3_GAME/PARAM.SFO')
+```
+
+The path is built as `<vfs root>/PS3_GAME/PARAM.SFO`, which is correct for a
+disc-style root and wrong for a root at `USRDIR` - which this title needs,
+because it opens its content by relative path. So the SFO was silently missed and
+the title id fell back to `BLES00000`, which is also the directory saves would
+have gone to. The lookup now tries the plausible layouts and takes the first that
+exists:
+
+```
+[cellGame] title id from PARAM.SFO ('vfs/PS3_GAME/USRDIR/../PARAM.SFO'): 'NPUB30003'
+```
+
+**A full mailbox now waits rather than being refused.** `CELL_EBUSY` is what
+hardware returns, but the two callers in this title disagree about it. One
+retries - spinning thousands of times, burning CPU the renderer needs. The other
+writes once, treats the error as "sent", and goes straight to
+`sys_event_queue_receive`, which deadlocks outright: the worker waits for the
+command that was just refused while the PPU waits for its reply. Waiting briefly
+for the slot loses no command and lets the spinner sleep instead.
+
+The effect was larger than expected - it fixed the nondeterminism too:
+
+| run | draw log lines | `rwt.sr` opened | mailbox waits | failed writes | PPU threads |
+|---|---|---|---|---|---|
+| 1 | 24 (capped) | yes | 8 | 0 | 5 |
+| 2 | 24 (capped) | yes | 4 | 0 | 5 |
+
+Both runs saturate the draw cap (~4,000 real draws) where two in three used to
+stall after ten. Four to eight one-millisecond waits replaced thousands of spins.
+
+### Reaching the romset
+
+The title now gets as far as **opening `rwt.sr`**, the 38 MB romset container the
+arcade emulator interprets:
+
+```
+[fs] open '/dev_hdd0/game/NPUB30003/USRDIR/rwt.sr' -> fd 4
+```
+
+It never reads a byte from it. Immediately after the open, game thread 5 goes to
+`sys_event_queue_receive(q=2)` and stays there.
+
+### Where it stands
+
+Both sides are alive and neither is stuck on anything we can see failing. The
+MultiStream worker is blocked in `rdch` at LS `0x015B8` waiting for its next
+command; thread 5 waits on queue 2 for a reply. The worker *does* reply, but it
+sends the same `intr=0 val=0x00000001` / `intr=1 val=0x2A000001` pair every time,
+so whatever thread 5 is waiting for is not what it is being sent.
+
+Attract mode needs the arcade core running, and the arcade core needs `rwt.sr`
+read - so this protocol gap is directly in the way.
+
 ### Next
 
-1. **Identify the wrong logo.** One bad logo among several correct ones points at
-   a single texture format / swizzle / palette case rather than a broken
-   pipeline. Log the texture format and dimensions per logo load and compare the
-   odd one against its neighbours.
-2. **Chase the remaining nondeterminism.** Two runs stall after ten draws
-   while a third renders thousands - a real fork in behaviour, not jitter.
-3. **The logos advance slowly even on a good run.** The guest timebase is not
-   the cause: `ppu_timebase_now` is wall-clock anchored at the correct 79.8 MHz.
-   The prime suspect is the mailbox retry loop - one run spun 2,731 EBUSY
-   retries, and a PPU thread busy-waiting on a full mailbox steals CPU from
-   everything else. Making a full-mailbox write WAIT for the worker to drain,
-   rather than returning EBUSY immediately into a hot retry loop, is the next
-   thing to try.
-4. **Get a real draw counter.** Every count so far came from a capped log line.
+1. **Work out what thread 5 is waiting for on queue 2.** It parks at guest
+   `cia=0x00153808` / `lr=0x000BCC74`; disassembling around there should show
+   which event field it tests, and therefore what the SPU is failing to send.
+2. Check whether the repeated `0x2A000001` completion is the right reply for
+   every command or a generic one the worker sends when it does not understand
+   the request.
 3. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
    `cellPadSetPressMode`, `cellPadSetSensorMode`, `inet_addr`.
-4. Fix the watchdog NID-to-name table so `0x1BC200F4` reports
-   `sys_lwmutex_unlock`.
-5. Get `rwt.sr` opening - the romset container still has not been touched, so the
-   arcade emulator core has not started.
+4. **A real inbox FIFO.** The SPU inbound mailbox is 4-deep on hardware and a
+   single slot here; the bounded wait papers over that.
+5. Identify the one logo that renders incorrectly - a single bad texture among
+   correct ones usually means one format or swizzle case.
