@@ -10,7 +10,7 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 
 ## 🎯 Status
 
-**Boots, renders, and the audio mixer is live.** Draws are flowing; a mailbox flood now throttles progress.
+**Boots and plays its logo sequence on screen.** The Midway legal screen, the Backbone logo and the rest of the boot logos render; one logo is visibly wrong.
 
 | Milestone | Status |
 |---|---|
@@ -27,39 +27,59 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | MultiStream SPU thread runs | ✅ `SPU thread started successfully` |
 | Front-end assets load | ✅ fonts, strings, logos, every menu texture |
 | SPU mixer answers the PPU | ✅ live worker, real command/reply traffic |
-| Menus render | ⚠️ 20 draws and climbing (was 2) |
+| Boot logo sequence on screen | ✅ Midway legal, Backbone, others (one logo wrong) |
+| Menus render | ⚠️ not reached yet |
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current blocker - the PPU floods the SPU mailbox
+### Current status - the logo sequence plays
 
-The MultiStream mixer is now a **live persistent worker**: it blocks inside
-`rdch` on its own host thread, the PPU pokes its mailbox with
-`sys_spu_thread_write_spu_mb`, it wakes where it stood with its registers
-intact, does the work, and writes back.
+Confirmed on screen, not inferred from counters: the title boots into its logo
+sequence and plays through it - the **Midway legal screen**, the **Backbone
+logo**, and the rest of the boot logos. One logo does not render correctly; the
+others look right.
 
-```
-[SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> live worker
-[SPU->PPU] mbox deliver spu=0x2000 intr=0 val=0x00000001 -> q=2
-[SPU->PPU] mbox deliver spu=0x2000 intr=1 val=0x2A000001 -> q=2
-```
+That is the first visual confirmation the recompiled title is producing real
+frames, and it lands well past the point where it used to deadlock.
 
-That took draws from **2 to 20** and RSX draws from 2 to 32.
+Underneath it, the MultiStream mixer is a live persistent worker: it blocks
+inside `rdch` on its own host thread, the PPU pokes its mailbox with
+`sys_spu_thread_write_spu_mb`, and it wakes where it stood with registers intact,
+works, and replies to the right queue.
 
-What is left is a throughput mismatch. A second game thread (tid 5) writes the
-same command in a tight loop and waits on queue 2 for each reply:
+Three consecutive runs of the same binary:
 
-```
-[SPU] write_spu_mb tid=0x2000 val=0x102F2780 -> live worker
-[WAIT] event_queue_receive(q=2 timeout=0) tid=5 cia=0x00153808
-```
+| run | draw log lines | RSX log lines | PPU threads | mailbox BUSY | worker re-runs |
+|---|---|---|---|---|---|
+| 1 | 10 | 10 | 5 | 1 | 0 |
+| 2 | 10 | 10 | 5 | 1 | 0 |
+| 3 | 24 (capped) | 32 (capped) | 5 | 2731 | 0 |
 
-**42,562 mailbox writes produced only 32 replies.** The SPU inbound mailbox is
-only a few words deep, so writes arriving faster than the worker drains them are
-being lost. On hardware `sys_spu_thread_write_spu_mb` reports a full mailbox
-rather than silently dropping, and the writer retries - so the next step is
-honouring mailbox depth (and returning EBUSY when full) instead of always
-accepting the write.
+**Read that table carefully - those are log lines, not draws.** Both counters are
+capped: the D3D12 one logs its first 20 calls then every 1000th, and the RSX one
+stops after 32. So run 1 and run 2 really did issue only ten draws and stalled,
+while run 3 saturated both caps - 24 lines means roughly *four thousand* draws,
+which is the run that actually plays the logo sequence.
+
+The spread between runs is therefore enormous (ten draws versus thousands), not
+the mild 10-vs-24 jitter the raw numbers suggest. A saturating counter is not a
+measurement.
+
+`re-runs = 0` is the column that matters: the worker is always alive when the PPU
+writes to it, so no command is ever delivered by restarting it from its entry.
+Some runs stall after ten draws and others render the whole sequence, so
+something downstream is still timing-dependent.
+
+**Known visual bug:** one logo in the boot sequence draws incorrectly while the
+rest are fine. Worth pinning down which one - a single bad logo among correct
+ones usually means one texture format or swizzle case, not a broken pipeline.
+
+> **A measurement lesson.** An earlier build reached 20 draws and looked like a
+> win. It was not: the mailbox path was logging *every* write, and 42,562
+> `fprintf`+`fflush` calls were slowing the PPU just enough for the SPU worker to
+> win a race it normally lost. Removing the logging dropped it straight back to
+> 2 draws. The real fix was a start handshake, not the logging. Any result that
+> depends on how much you are printing is not a result.
 
 ---
 
@@ -225,6 +245,19 @@ PS3_VFS_ROOT=vfs/PS3_GAME/USRDIR PS3_HDD0_ROOT=hdd0 \
   expected to be absent on a first run.
 
 ## 🔧 Upstream fixes made for this port
+
+- `runtime/syscalls/lv2_register.c` - **worker start handshake.**
+  `sys_spu_thread_group_start` now waits (bounded) for a spawned persistent
+  worker to publish its live context before returning. Without it the PPU could
+  call `sys_spu_thread_write_spu_mb` first, see a null context, and fall back to
+  re-running the worker from its entry - which restarts init and swallows the
+  command as a startup parameter.
+- `runtime/syscalls/lv2_register.c` - **SPU mailbox back-pressure.** The inbound
+  mailbox is a single slot and `spu_channel_write` overwrites unconditionally, so
+  a PPU thread writing faster than the worker drained silently destroyed
+  commands. `sys_spu_thread_write_spu_mb` now reports `CELL_EBUSY` on a full
+  mailbox (and still wakes the worker, so back-pressure cannot become livelock),
+  which is what hardware does and what the game's retry loop already expects.
 
 - `runtime/syscalls/lv2_register.c` - **SPU thread events are routed per SPU
   PORT.** `sys_spu_thread_connect_event(id, eq, et, spup)` binds one queue per

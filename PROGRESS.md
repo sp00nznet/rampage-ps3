@@ -482,14 +482,94 @@ reply:
 **42,562 mailbox writes, 32 replies.** The SPU inbound mailbox is only a few
 words deep, so writes arriving faster than the worker drains them are being lost.
 
+### Session 1e - a result that was really a timing artifact
+
+The 42,562-writes-to-32-replies flood pointed at mailbox depth, so
+`sys_spu_thread_write_spu_mb` was changed to report `CELL_EBUSY` on a full
+inbound mailbox instead of overwriting it - what hardware does, and what the
+game's retry loop already expects.
+
+Draws promptly fell from 20 back to **2**, and stayed there across three runs.
+
+The `EBUSY` path had never once executed. What the log actually said was:
+
+```
+[SPU] write_spu_mb tid=0x2000 val=0x0000FFDD -> re-running worker
+```
+
+**"re-running worker"**, not "live worker" - the fallback path, taken because
+`live_ctx` was null. The PPU was reaching `write_spu_mb` before the freshly
+spawned worker thread had published its context, so the command was delivered by
+restarting the worker from its entry, which re-ran init and consumed the word as
+a startup parameter.
+
+That race had been there the whole time. It only stayed hidden because the
+previous build logged *every* mailbox write: 42,562 `fprintf`+`fflush` calls were
+slowing the PPU down just enough for the worker to win. Capping the log to 32
+lines removed the delay and exposed it. **The 20-draw result was an artifact of
+its own instrumentation.**
+
+Fix: a bounded start handshake in `sys_spu_thread_group_start`, which does not
+return until a spawned persistent worker has published its live context.
+`spu_raw.c` gates on a `started` flag for exactly this reason.
+
+Three consecutive runs afterwards:
+
+| run | draw log lines | RSX log lines | PPU threads | mailbox BUSY | worker re-runs |
+|---|---|---|---|---|---|
+| 1 | 10 | 10 | 5 | 1 | 0 |
+| 2 | 10 | 10 | 5 | 1 | 0 |
+| 3 | 24 (capped) | 32 (capped) | 5 | 2731 | 0 |
+
+**Read that table carefully - those are log lines, not draws.** Both counters are
+capped: the D3D12 one logs its first 20 calls then every 1000th, and the RSX one
+stops after 32. So run 1 and run 2 really did issue only ten draws and stalled,
+while run 3 saturated both caps - 24 lines means roughly *four thousand* draws,
+which is the run that actually plays the logo sequence.
+
+The spread between runs is therefore enormous (ten draws versus thousands), not
+the mild 10-vs-24 jitter the raw numbers suggest. A saturating counter is not a
+measurement.
+
+`re-runs = 0` everywhere: the worker is always live when the PPU writes to it.
+Back-pressure is genuinely active, and five PPU threads come up rather than
+three.
+
+### It plays the logo sequence
+
+Watching the actual window rather than the counters: the title boots into its
+logo sequence and plays through it - the **Midway legal screen**, the **Backbone
+logo**, and the rest of the boot logos. One logo does not render correctly; the
+others look right.
+
+This matters beyond the milestone itself. Every measurement up to here was a
+draw count or a log line, and draw counts cannot tell correct pixels from
+garbage. The first look at the window confirmed both that the pipeline is
+genuinely producing frames and that there is a specific rendering defect worth
+chasing - neither of which any counter reported.
+
+### Where it stands
+
+The logo sequence plays, but not on every run: some stall after ten draws
+while others render thousands. Progress is still timing-dependent, and the
+user reports the logos advance slowly even on a good run.
+
 ### Next
 
-1. **Honour SPU mailbox depth.** `sys_spu_thread_write_spu_mb` currently always
-   accepts the write; hardware reports a full mailbox instead, and the writer
-   retries - which is exactly what thread 5 is already doing. Returning EBUSY on
-   a full inbox should convert the flood into proper back-pressure.
-2. Check whether every command actually warrants a reply, or whether the worker
-   is replying correctly and only the dropped writes are missing.
+1. **Identify the wrong logo.** One bad logo among several correct ones points at
+   a single texture format / swizzle / palette case rather than a broken
+   pipeline. Log the texture format and dimensions per logo load and compare the
+   odd one against its neighbours.
+2. **Chase the remaining nondeterminism.** Two runs stall after ten draws
+   while a third renders thousands - a real fork in behaviour, not jitter.
+3. **The logos advance slowly even on a good run.** The guest timebase is not
+   the cause: `ppu_timebase_now` is wall-clock anchored at the correct 79.8 MHz.
+   The prime suspect is the mailbox retry loop - one run spun 2,731 EBUSY
+   retries, and a PPU thread busy-waiting on a full mailbox steals CPU from
+   everything else. Making a full-mailbox write WAIT for the worker to drain,
+   rather than returning EBUSY immediately into a hot retry loop, is the next
+   thing to try.
+4. **Get a real draw counter.** Every count so far came from a capped log line.
 3. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
    `cellPadSetPressMode`, `cellPadSetSensorMode`, `inet_addr`.
 4. Fix the watchdog NID-to-name table so `0x1BC200F4` reports

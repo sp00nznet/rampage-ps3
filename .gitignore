@@ -26,3 +26,13 @@ build/
 _boot*.out
 _boot*.err
 hdd0/
+
+# Stray decrypted executables and run logs (never commit game code)
+*.ELF
+*.elf
+*.self
+*.BIN
+_r*.out
+_r*.err
+_h*.out
+_h*.err
