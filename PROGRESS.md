@@ -619,17 +619,77 @@ so whatever thread 5 is waiting for is not what it is being sent.
 Attract mode needs the arcade core running, and the arcade core needs `rwt.sr`
 read - so this protocol gap is directly in the way.
 
+### Session 1g - chasing attract mode to the flip handler
+
+Thread 5's park at `lr=0x000BCC74` turned out not to be a park at all. The
+disassembly shows a double-buffered 64-byte command block being handed to a
+wrapper at `0x13A334`, and the log has **39,630** of those waits in sixty
+seconds: thread 5 is cycling its SPU audio RPC at roughly 660 Hz and the mixer
+answers every time. Alive, not stuck.
+
+Following the file activity instead gave the real shape. The front-end loads
+*completely* - every `FE_IMAGES` texture and every `PS3_IMAGES` asset, ending at
+`08_screen_options/icon_border` on log line 2,340. After that, in a four-minute
+run, there are **148,287 more lines and not one further file open**.
+
+`rwt.sr` is opened exactly once and **never read** - zero reads on its fd. The
+open sits between `ACHIEVEMENT_6` and `ACHIEVEMENT_7` in the texture loop, so it
+is an existence probe, not the arcade core starting. (An earlier "50 reads"
+figure was my own bad grep: it counted every fd, and fd 4 had been reused by
+texture loads before `rwt.sr` ever got it.)
+
+### Why it never advances
+
+**No flip ever happens.** The title registers a flip handler at boot and it is
+never invoked once:
+
+```
+[cellGcmSys] SetFlipHandler(opd=0x00157FB0)     <- registered
+cellGcmSetFlipCommand calls: 0
+flip callbacks fired:        0
+```
+
+The runtime only invokes the guest flip handler from `cellGcmSetFlipCommand` and
+`cellGcmSetPrepareFlip`. This title imports neither. What it *does* import is
+telling:
+
+| imported | not imported |
+|---|---|
+| `cellGcmSetFlipMode`, `cellGcmSetFlipHandler` | `cellGcmSetFlipCommand` |
+| `cellGcmSetWaitFlip`, `cellGcmGetControlRegister` | `cellGcmSetPrepareFlip` |
+| `cellGcmGetLabelAddress` | |
+
+That is the signature of a title driving flips **inline through the command
+buffer** - writing the flip itself and polling a label plus the control register,
+the way libgcm's inline path works - rather than calling a firmware export.
+`libs/video/rsx_commands.c` has no flip handling at all, so nothing notices.
+
+The runtime already has the pieces on the other side: guest-visible labels the
+game can poll (`cellGcmGetLabelAddress`), and a `cellGcmSetWaitFlip` that blocks
+while a flip is pending. What is missing is anything that *requests* a flip for a
+title that never calls the two functions the request is wired to.
+
+A front-end whose state machine advances on the flip callback parks exactly as
+observed: fully loaded, still rendering, still talking to its audio SPU, and
+never moving on.
+
+### A correction
+
+Two runs both saturating the draw-log cap was too small a sample to call the
+behaviour deterministic. A later four-minute run produced only **18 draws**. The
+run-to-run spread is still real, and the mailbox fix reduced it rather than
+removing it.
+
 ### Next
 
-1. **Work out what thread 5 is waiting for on queue 2.** It parks at guest
-   `cia=0x00153808` / `lr=0x000BCC74`; disassembling around there should show
-   which event field it tests, and therefore what the SPU is failing to send.
-2. Check whether the repeated `0x2A000001` completion is the right reply for
-   every command or a generic one the worker sends when it does not understand
-   the request.
-3. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
+1. **Make a flip happen.** Detect the inline flip in the RSX command stream and
+   drive the existing path: update the flip label and status, then invoke the
+   registered handler OPD. That is what the front-end state machine is waiting
+   for, and it is squarely between here and attract mode.
+2. Confirm which label the title polls (it calls `cellGcmGetLabelAddress`), and
+   whether `cellGcmSetWaitFlip` is being entered at all.
+3. Once frames flip, re-check whether `rwt.sr` starts being read - the arcade
+   core cannot start until it is.
+4. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
    `cellPadSetPressMode`, `cellPadSetSensorMode`, `inet_addr`.
-4. **A real inbox FIFO.** The SPU inbound mailbox is 4-deep on hardware and a
-   single slot here; the bounded wait papers over that.
-5. Identify the one logo that renders incorrectly - a single bad texture among
-   correct ones usually means one format or swizzle case.
+5. Identify the one logo that renders incorrectly.

@@ -32,29 +32,45 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current status - logo sequence plays, romset opened, attract not reached
+### Current blocker - the flip handler can never fire
 
-The title boots, plays its logo sequence on screen (Midway legal, Backbone, and
-the rest), and gets as far as **opening `rwt.sr`** - the 38 MB romset container
-the arcade emulator interprets. It does not read from it yet, so the arcade core
-has not started and attract mode is not reached.
+The front-end now loads **completely**: every `FE_IMAGES` texture and every
+`PS3_IMAGES` asset through `08_screen_options/icon_border`. Then it parks. In a
+four-minute run there are 148,287 further log lines and **zero further file
+opens**.
 
-Rendering is now deterministic. Two consecutive runs:
+It is not deadlocked. Game thread 5 cycles its SPU audio RPC about 660 times a
+second and the mixer answers every time. Everything is alive - it simply never
+advances.
 
-| run | draw log lines | `rwt.sr` opened | mailbox waits | failed writes | PPU threads |
-|---|---|---|---|---|---|
-| 1 | 24 (capped) | yes | 8 | 0 | 5 |
-| 2 | 24 (capped) | yes | 4 | 0 | 5 |
+**Zero flips happen, ever.** The title registers a flip handler at boot
+(`cellGcmSetFlipHandler`, OPD `0x00157FB0`) and the handler is never once
+invoked, because the runtime only calls it from `cellGcmSetFlipCommand` and
+`cellGcmSetPrepareFlip` - and this title imports neither:
 
-Both saturate the draw-log cap, which is roughly four thousand real draws. Before
-the mailbox fix, two runs in three stalled after ten draws.
+| imported | not imported |
+|---|---|
+| `cellGcmSetFlipMode`, `cellGcmSetFlipHandler` | `cellGcmSetFlipCommand` |
+| `cellGcmSetWaitFlip`, `cellGcmGetControlRegister` | `cellGcmSetPrepareFlip` |
+| `cellGcmGetLabelAddress` | |
 
-**Where it stops.** The MultiStream worker is alive and blocked in `rdch` at LS
-`0x015B8` waiting for its next command, while game thread 5 waits on event queue
-2 for a reply. The worker does reply - the same
-`intr=0 val=0x00000001` / `intr=1 val=0x2A000001` pair each time - so the reply
-thread 5 is waiting for is not the one it is getting. That protocol layer is the
-next thing to work out.
+That import set is the signature of a title driving flips **inline through the
+command buffer**, polling a label and the control register rather than calling a
+firmware export. `libs/video/rsx_commands.c` contains no flip handling of any
+kind, so nothing in the pipeline can notice the flip and fire the callback.
+
+A front-end whose state machine advances on the flip callback stalls here
+exactly as observed - fully loaded, rendering, talking to its audio SPU, and
+never moving on.
+
+**`rwt.sr` is opened but never read** (zero reads on its fd). The open happens
+mid-texture-load, between `ACHIEVEMENT_6` and `ACHIEVEMENT_7`, so it is an
+existence probe - not the arcade core starting. Attract mode needs that core, so
+the flip gap is directly in the way.
+
+> **Correction to an earlier claim.** Two runs both hitting the draw-log cap was
+> too small a sample to call this deterministic: a later four-minute run produced
+> only 18 draws. The run-to-run spread is still real.
 
 ---
 
