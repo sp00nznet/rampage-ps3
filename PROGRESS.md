@@ -680,16 +680,62 @@ behaviour deterministic. A later four-minute run produced only **18 draws**. The
 run-to-run spread is still real, and the mailbox fix reduced it rather than
 removing it.
 
+### Session 1h - ruling out the flip, properly
+
+The previous session ended on "the flip handler can never fire, because the
+runtime only invokes it from two functions this title does not import." That was
+true but incomplete, and the completion changes the conclusion.
+
+The runtime has a *second* flip path the earlier write-up missed: the FIFO drain
+in `cellGcmSys.c` already decodes an in-FIFO `0xFEAD0000 | id` flip word and
+calls `cellGcmSetFlipCommand` itself. So a title that flips inline is handled -
+this one still never flips.
+
+Every mechanism was checked:
+
+| checked | result |
+|---|---|
+| `cellGcmSetFlipCommand` / `cellGcmSetPrepareFlip` | 0 calls, neither imported |
+| in-FIFO `0xFEAD0000 \| id` word | 0 matches (`flipword` counter never ticks) |
+| RSX method `0xFEAC` (rpcs3's `GCM_FLIP_COMMAND = 0xFEAC >> 2`) | absent |
+| subchannel 7, method `0x1EAC` (what `0xFEAC` decodes to) | no subch-7 traffic at all |
+| FIFO resync silently dropping commands | never fires |
+| `cellGcmSetWaitFlip` blocking forever | cannot - it sleeps 64 ms then forces DONE |
+
+`0xFEAC` needed care: rpcs3 folds the subchannel into its method index, so
+`0xFEAC >> 13 = 7` with remainder `0x1EAC` - the flip arrives as **subchannel 7,
+method 0x1EAC**. Our drain routes subchannel 7 to `gcm_2d_method` rather than
+`rsx_process_method`, which is exactly why it could never have shown up in an
+unknown-method histogram. Checking subchannel 7 directly (`GCM_SUBCH7=1`) found
+no traffic on it whatsoever.
+
+The conclusion is a negative result, and a useful one: **this is not a decode gap
+on our side.** The title builds roughly 99 frames of command traffic in a good
+run and never once asks to present them.
+
+### Diagnostics added
+
+Both were needed because the existing ones structurally could not see the thing
+being looked for:
+
+- `RSX_UNKNOWN_HIST=<n>` - per-method histogram of unrecognised RSX methods. The
+  old logging printed the first 50 and stopped, and fifty lines are used up by
+  one-shot setup writes long before a frame loop starts, so nothing issued
+  per-frame could ever appear.
+- `SPU_CHHIST` now takes an interval and also instruments `spu_rchcnt`. It was
+  hardcoded to dump every 2000 accesses and covered only `spu_wrch`/`spu_rdch` -
+  never `spu_rchcnt`, which is where a parked worker actually sits.
+
 ### Next
 
-1. **Make a flip happen.** Detect the inline flip in the RSX command stream and
-   drive the existing path: update the flip label and status, then invoke the
-   registered handler OPD. That is what the front-end state machine is waiting
-   for, and it is squarely between here and attract mode.
-2. Confirm which label the title polls (it calls `cellGcmGetLabelAddress`), and
-   whether `cellGcmSetWaitFlip` is being entered at all.
-3. Once frames flip, re-check whether `rwt.sr` starts being read - the arcade
-   core cannot start until it is.
-4. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
+1. **Trace the 520 us poll at `lr=0x00066AB0`.** It appears once the front-end has
+   finished loading and runs alongside the audio RPC - the shape of a frame loop
+   waiting on a condition. Whatever it tests is what the title wants before it
+   will present.
+2. Check what the title does with `cellGcmGetLabelAddress` and
+   `cellGcmGetControlRegister` - both imported, and both are how an inline-flip
+   title decides a flip has completed. If it is waiting on a label our engine
+   never updates, it would render forever without flipping.
+3. Implement the four remaining NIDs: `cellAudioSetPortLevel`,
    `cellPadSetPressMode`, `cellPadSetSensorMode`, `inet_addr`.
-5. Identify the one logo that renders incorrectly.
+4. Identify the one logo that renders incorrectly.

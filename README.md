@@ -32,45 +32,44 @@ and [Simpsons Arcade](https://github.com/sp00nznet/simpsons) PS3 ports.
 | Input | ❌ not reached |
 | Playable | ❌ not yet |
 
-### Current blocker - the flip handler can never fire
+### Current blocker - the title never asks for a flip
 
-The front-end now loads **completely**: every `FE_IMAGES` texture and every
-`PS3_IMAGES` asset through `08_screen_options/icon_border`. Then it parks. In a
-four-minute run there are 148,287 further log lines and **zero further file
-opens**.
+The front-end loads **completely** - every `FE_IMAGES` texture and every
+`PS3_IMAGES` asset through `08_screen_options/icon_border` - and then parks. In a
+four-minute run there are 148,287 further log lines and zero further file opens.
 
-It is not deadlocked. Game thread 5 cycles its SPU audio RPC about 660 times a
-second and the mixer answers every time. Everything is alive - it simply never
-advances.
+Nothing is deadlocked. Game thread 5 cycles its SPU audio RPC ~660 times a second
+and the mixer answers every one. The title keeps building command buffers: a good
+run shows about **99 frames' worth** of per-frame RSX method traffic.
 
-**Zero flips happen, ever.** The title registers a flip handler at boot
-(`cellGcmSetFlipHandler`, OPD `0x00157FB0`) and the handler is never once
-invoked, because the runtime only calls it from `cellGcmSetFlipCommand` and
-`cellGcmSetPrepareFlip` - and this title imports neither:
+But **no flip is ever requested**, so the flip handler it registered at boot
+(`cellGcmSetFlipHandler`, OPD `0x00157FB0`) is never invoked, and a front-end
+whose state machine advances on that callback cannot move on.
 
-| imported | not imported |
+This was chased through every mechanism a PS3 title can use to flip, and all of
+them came back empty:
+
+| checked | result |
 |---|---|
-| `cellGcmSetFlipMode`, `cellGcmSetFlipHandler` | `cellGcmSetFlipCommand` |
-| `cellGcmSetWaitFlip`, `cellGcmGetControlRegister` | `cellGcmSetPrepareFlip` |
-| `cellGcmGetLabelAddress` | |
+| `cellGcmSetFlipCommand` / `cellGcmSetPrepareFlip` HLE calls | 0 - not even imported |
+| in-FIFO `0xFEAD0000 \| id` flip word (runtime already decodes this) | 0 matches |
+| RSX method `0xFEAC` (`GCM_FLIP_COMMAND`) | absent |
+| subchannel 7 traffic (where `0xFEAC` decodes to: subch 7, method `0x1EAC`) | **no subchannel-7 methods at all** |
+| FIFO resync discarding commands | never fires |
 
-That import set is the signature of a title driving flips **inline through the
-command buffer**, polling a label and the control register rather than calling a
-firmware export. `libs/video/rsx_commands.c` contains no flip handling of any
-kind, so nothing in the pipeline can notice the flip and fire the callback.
+So it is not a decode gap on our side - the title genuinely never emits a flip.
+It renders frame after frame into the same buffer and waits for something else.
 
-A front-end whose state machine advances on the flip callback stalls here
-exactly as observed - fully loaded, rendering, talking to its audio SPU, and
-never moving on.
+The most promising thread is a poll loop that appears once the front-end is
+loaded: `timer_usleep(520 us)` from `lr=0x00066AB0`, running alongside the audio
+RPC. That is the shape of a frame loop waiting on a condition, and working out
+what it tests is the next step.
 
-**`rwt.sr` is opened but never read** (zero reads on its fd). The open happens
-mid-texture-load, between `ACHIEVEMENT_6` and `ACHIEVEMENT_7`, so it is an
-existence probe - not the arcade core starting. Attract mode needs that core, so
-the flip gap is directly in the way.
-
-> **Correction to an earlier claim.** Two runs both hitting the draw-log cap was
-> too small a sample to call this deterministic: a later four-minute run produced
-> only 18 draws. The run-to-run spread is still real.
+> Two runtime diagnostics were added while chasing this and are worth keeping:
+> `RSX_UNKNOWN_HIST=<n>` dumps a per-method histogram of unrecognised RSX methods
+> (the old fixed cap of 50 lines was consumed by one-shot setup writes long
+> before any frame loop began, so nothing per-frame could ever appear), and
+> `SPU_CHHIST` now takes an interval and also covers `spu_rchcnt`.
 
 ---
 
